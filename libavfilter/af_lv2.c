@@ -27,6 +27,9 @@
 #include <lilv/lilv.h>
 #include <lv2/lv2plug.in/ns/ext/atom/atom.h>
 #include <lv2/lv2plug.in/ns/ext/buf-size/buf-size.h>
+#include <lv2/lv2plug.in/ns/ext/options/options.h>
+#include <lv2/lv2plug.in/ns/ext/parameters/parameters.h>
+#include <lv2/lv2plug.in/ns/ext/worker/worker.h>
 
 #include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
@@ -45,7 +48,7 @@ typedef struct URITable {
 typedef struct LV2Context {
     const AVClass *class;
     char *plugin_uri;
-    char *options;
+    char *controls_str;
 
     unsigned nb_inputs;
     unsigned nb_inputcontrols;
@@ -56,18 +59,23 @@ typedef struct LV2Context {
     int64_t pts;
     int64_t duration;
 
-    LilvWorld         *world;
-    const LilvPlugin  *plugin;
-    uint32_t           nb_ports;
-    float             *values;
-    URITable           uri_table;
-    LV2_URID_Map       map;
-    LV2_Feature        map_feature;
-    LV2_URID_Unmap     unmap;
-    LV2_Feature        unmap_feature;
-    LV2_Atom_Sequence  seq_in[2];
-    LV2_Atom_Sequence *seq_out;
-    const LV2_Feature *features[5];
+    LilvWorld            *world;
+    const LilvPlugin     *plugin;
+    uint32_t              nb_ports;
+    float                *values;
+    URITable              uri_table;
+    LV2_URID_Map          map;
+    LV2_Feature           map_feature;
+    LV2_URID_Unmap        unmap;
+    LV2_Feature           unmap_feature;
+    LV2_Options_Option   *options;
+    LV2_Feature           options_feature;
+    LV2_Worker_Interface *worker_intf;
+    LV2_Worker_Schedule   worker;
+    LV2_Feature           worker_feature;
+    LV2_Atom_Sequence     seq_in[2];
+    LV2_Atom_Sequence    *seq_out;
+    const LV2_Feature    *features[7];
 
     float *mins;
     float *maxes;
@@ -95,8 +103,8 @@ typedef struct LV2Context {
 static const AVOption lv2_options[] = {
     { "plugin", "set plugin uri", OFFSET(plugin_uri), AV_OPT_TYPE_STRING, .flags = FLAGS },
     { "p",      "set plugin uri", OFFSET(plugin_uri), AV_OPT_TYPE_STRING, .flags = FLAGS },
-    { "controls", "set plugin options", OFFSET(options), AV_OPT_TYPE_STRING, .flags = FLAGS },
-    { "c",        "set plugin options", OFFSET(options), AV_OPT_TYPE_STRING, .flags = FLAGS },
+    { "controls", "set plugin options", OFFSET(controls_str), AV_OPT_TYPE_STRING, .flags = FLAGS },
+    { "c",        "set plugin options", OFFSET(controls_str), AV_OPT_TYPE_STRING, .flags = FLAGS },
     { "sample_rate", "set sample rate", OFFSET(sample_rate), AV_OPT_TYPE_INT, {.i64=44100}, 1, INT32_MAX, FLAGS },
     { "s",           "set sample rate", OFFSET(sample_rate), AV_OPT_TYPE_INT, {.i64=44100}, 1, INT32_MAX, FLAGS },
     { "nb_samples", "set the number of samples per requested frame", OFFSET(nb_samples), AV_OPT_TYPE_INT, {.i64=1024}, 1, INT_MAX, FLAGS },
@@ -221,6 +229,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     lilv_instance_run(s->instance, in->nb_samples);
 
+    if (s->worker_intf && s->worker_intf->end_run)
+        s->worker_intf->end_run(lilv_instance_get_handle(s->instance));
+
     if (out != in)
         av_frame_free(&in);
 
@@ -262,12 +273,39 @@ static const LV2_Feature buf_size_features[3] = {
     { LV2_BUF_SIZE__boundedBlockLength,  NULL },
 };
 
+static LV2_Worker_Status worker_respond(LV2_Worker_Respond_Handle handle, uint32_t size, const void *data)
+{
+    LV2Context *s = (LV2Context*)handle;
+    if (s->worker_intf == NULL) {
+        return LV2_WORKER_ERR_UNKNOWN;
+    }
+    return s->worker_intf->work_response(
+        /*instance=*/lilv_instance_get_handle(s->instance),
+        /*size=*/size,
+        /*data=*/data);
+}
+
+static LV2_Worker_Status worker_schedule_work(LV2_Worker_Schedule_Handle handle, uint32_t size, const void *data)
+{
+    LV2Context *s = (LV2Context*)handle;
+    if (s->worker_intf == NULL) {
+        return LV2_WORKER_ERR_UNKNOWN;
+    }
+    return s->worker_intf->work(
+        /*instance=*/lilv_instance_get_handle(s->instance),
+        /*respond=*/worker_respond,
+        /*handle=*/s,
+        /*size=*/size,
+        /*data=*/data);
+}
+
 static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     LV2Context *s = ctx->priv;
     char *p, *arg, *saveptr = NULL;
-    int i, sample_rate;
+    int i, sample_rate, options_count = 1;
+    bool include_block_lengths = false;
 
     uri_table_init(&s->uri_table);
     s->map.handle = &s->uri_table;
@@ -278,11 +316,60 @@ static int config_output(AVFilterLink *outlink)
     s->unmap.unmap  = uri_table_unmap;
     s->unmap_feature.URI = LV2_URID_UNMAP_URI;
     s->unmap_feature.data = &s->unmap;
+    s->options_feature.URI = LV2_OPTIONS__options;
+    s->worker.handle = s;
+    s->worker.schedule_work = worker_schedule_work;
+    s->worker_intf = NULL;
+    s->worker_feature.URI = LV2_WORKER__schedule;
+    s->worker_feature.data = &s->worker;
     s->features[0] = &s->map_feature;
     s->features[1] = &s->unmap_feature;
     s->features[2] = &buf_size_features[0];
     s->features[3] = &buf_size_features[1];
     s->features[4] = &buf_size_features[2];
+    s->features[5] = &s->options_feature;
+    s->features[6] = &s->worker_feature;
+
+    if (ctx->nb_inputs &&
+        (lilv_plugin_has_feature(s->plugin, s->powerOf2BlockLength) ||
+         lilv_plugin_has_feature(s->plugin, s->fixedBlockLength))) {
+        AVFilterLink *inlink = ctx->inputs[0];
+
+        inlink->min_samples = inlink->max_samples = 4096;
+        options_count += 2;
+        include_block_lengths = true;
+    } else if (ctx->nb_inputs && lilv_plugin_has_feature(s->plugin, s->boundedBlockLength)) {
+        AVFilterLink *inlink = ctx->inputs[0];
+
+        inlink->max_samples = 4096;
+        options_count += 2;
+        include_block_lengths = true;
+    }
+
+    s->options = av_calloc(options_count + 1, sizeof(LV2_Options_Option));
+    s->options[0].subject = LV2_OPTIONS_INSTANCE;
+    s->options[0].key = uri_table_map(&s->uri_table, LV2_PARAMETERS__sampleRate);
+    s->options[0].type = uri_table_map(&s->uri_table, LV2_ATOM__Int);
+    s->options[0].size = sizeof(s->sample_rate);
+    s->options[0].value = &s->sample_rate;
+    if (include_block_lengths) {
+        AVFilterLink *inlink = ctx->inputs[0];
+
+        s->options[1].subject = LV2_OPTIONS_INSTANCE;
+        s->options[1].key = uri_table_map(&s->uri_table, LV2_BUF_SIZE__minBlockLength);
+        s->options[1].type = uri_table_map(&s->uri_table, LV2_ATOM__Int);
+        s->options[1].size = sizeof(inlink->min_samples);
+        s->options[1].value = &inlink->min_samples;
+
+        s->options[2].subject = LV2_OPTIONS_INSTANCE;
+        s->options[2].key = uri_table_map(&s->uri_table, LV2_BUF_SIZE__maxBlockLength);
+        s->options[2].type = uri_table_map(&s->uri_table, LV2_ATOM__Int);
+        s->options[2].size = sizeof(inlink->max_samples);
+        s->options[2].value = &inlink->max_samples;
+    }
+    s->options[options_count].key = 0;
+    s->options[options_count].value = 0;
+    s->options_feature.data = s->options;
 
     if (ctx->nb_inputs) {
         AVFilterLink *inlink = ctx->inputs[0];
@@ -318,7 +405,7 @@ static int config_output(AVFilterLink *outlink)
     if (!s->seq_out)
         return AVERROR(ENOMEM);
 
-    if (s->options && !strcmp(s->options, "help")) {
+    if (s->controls_str && !strcmp(s->controls_str, "help")) {
         if (!s->nb_inputcontrols) {
             av_log(ctx, AV_LOG_INFO,
                    "The '%s' plugin does not have any input controls.\n",
@@ -345,8 +432,8 @@ static int config_output(AVFilterLink *outlink)
         return AVERROR_EXIT;
     }
 
-    p = s->options;
-    while (s->options) {
+    p = s->controls_str;
+    while (s->controls_str) {
         const LilvPort *port;
         LilvNode *sym;
         float val;
@@ -377,14 +464,7 @@ static int config_output(AVFilterLink *outlink)
         }
     }
 
-    if (s->nb_inputs &&
-        (lilv_plugin_has_feature(s->plugin, s->powerOf2BlockLength) ||
-         lilv_plugin_has_feature(s->plugin, s->fixedBlockLength) ||
-         lilv_plugin_has_feature(s->plugin, s->boundedBlockLength))) {
-        AVFilterLink *inlink = ctx->inputs[0];
-
-        inlink->min_samples = inlink->max_samples = 4096;
-    }
+    s->worker_intf = (LV2_Worker_Interface*)lilv_instance_get_extension_data(s->instance, LV2_WORKER__interface);
 
     return 0;
 }
@@ -583,6 +663,7 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&s->maxes);
     av_freep(&s->controls);
     av_freep(&s->seq_out);
+    av_freep(&s->options);
 }
 
 static const AVFilterPad lv2_outputs[] = {
